@@ -1,261 +1,171 @@
-import os  
-import re
-import asyncio
-import tempfile
+import os
 import logging
+import tempfile
 import pandas as pd
 import pymysql
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
-    CallbackContext,
-    Application,
-    CommandHandler,
-    ConversationHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
+    Application, CommandHandler, CallbackContext, ConversationHandler,
+    CallbackQueryHandler, MessageHandler, filters
 )
 
-# Load environment
+# Load ENV dan logging
 load_dotenv()
-
-# DB config
-db_config = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "user": os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", ""),
-    "db": os.getenv("DB_NAME", "tlkm"),
-    "cursorclass": pymysql.cursors.DictCursor
-}
-
-# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# States
-ASK_WITEL, ASK_STO, ASK_SUBSTO, ASK_FILE = range(4)
-
-# Options
+# State mesin
+ASK_WITEL, ASK_FILE = range(2)
 WITEL_OPTIONS = ["MLG", "MNZ", "KDR"]
-STO_OPTIONS = {
-    "MLG": ["BTU", "KEP", "MLG"],
-    "MNZ": ["BJN", "MNZ", "NWI", "PON", "TNZ"],
-    "KDR": ["BLR", "PAE", "KDI", "NJK", "TRE", "TUL"]
-}
-SUBSTO_OPTIONS = {
-    # WITEL MLG
-    "BTU": ["BTU", "KPO", "NTG"],
-    "KEP": ["GKW", "KEP", "PGK", "SBP", "DPT", "SBM", "TUR", "BNR", "GDI", "APG", "DNO"],
-    "MLG": ["BLB", "GDG", "KLJ", "MLG", "PKS", "TMP", "BRG", "SWJ", "LWG", "SGS"],
 
-    # WITEL MNZ
-    "BJN": ["BJN", "KDU", "PAD", "SMJ"],
-    "MNZ": ["MNZ", "UTR", "MSP", "CRB"],
-    "NWI": ["MGT", "NWI", "GGR", "SAR", "WKU", "JGO", "KRJ"],
-    "PON": ["PON", "PNZ", "SMO", "PNG", "PLG", "SAT", "JEN", "SLH", "LOG"],
-    "TNZ": ["BCR", "JTR", "KRK", "MRR", "RGL", "TNZ", "TAW"],
+# Kolom tabel yang harus diisi
+COLUMNS = [
+    "witel", "sto", "gpon_hostname", "gpon_ip", "gpon_merk", "gpon_tipe", "gpon_merk_tipe",
+    "gpon_intf", "gpon_lacp", "neighbor_hostname", "neighbor_intf", "neighbor_lacp",
+    "bw", "sfp", "vlan_sip", "vlan_internet", "Keterangan", "OTN-CROSS METRO"
+]
 
-    # WITEL KDR
-    "BLR": ["BLR", "SNT", "PAN", "BNU", "KBN", "LDY", "WGI"],
-    "PAE": ["GUR", "WAT", "KAA", "PAE", "PPR"],
-    "KDI": ["KDI", "MJT", "NDL", "SBI"],
-    "NJK": ["GON", "NJK", "KTS", "PRB", "WRJ"],
-    "TRE": ["DRN", "PRI", "TRE"],
-    "TUL": ["CAT", "KWR", "NGU", "TUL"]
+# Konfigurasi DB
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "user": os.getenv("DB_USER", "root"),
+    "password": os.getenv("DB_PASS", ""),
+    "db": os.getenv("DB_NAME", "tlkm"),
+    "cursorclass": pymysql.cursors.DictCursor,
+    "charset": "utf8mb4"
 }
 
-# SQL templates
-INSERT_SQL = """
-INSERT INTO `{table}` (
-    witel, sto, gpon_hostname, gpon_ip, gpon_merk, gpon_tipe, gpon_merk_tipe,
-    gpon_intf, gpon_lacp, neighbot_hostname, neighbor_intf, neighbor_lacp,
-    bw, sfp, vlan_sip, vlan_internet, keterangan, otn_cross_metro
-) VALUES (
-    %(witel)s, %(sto)s, %(gpon_hostname)s, %(gpon_ip)s, %(gpon_merk)s,
-    %(gpon_tipe)s, %(gpon_merk_tipe)s, %(gpon_intf)s, %(gpon_lacp)s,
-    %(neighbot_hostname)s, %(neighbor_intf)s, %(neighbor_lacp)s,
-    %(bw)s, %(sfp)s, %(vlan_sip)s, %(vlan_internet)s,
-    %(keterangan)s, %(otn_cross_metro)s
-)
-"""
+def get_connection():
+    return pymysql.connect(**DB_CONFIG)
 
-UPDATE_SQL = """
-UPDATE `{table}` SET
-    gpon_ip = %(gpon_ip)s,
-    gpon_merk = %(gpon_merk)s,
-    gpon_tipe = %(gpon_tipe)s,
-    gpon_merk_tipe = %(gpon_merk_tipe)s,
-    gpon_intf = %(gpon_intf)s,
-    gpon_lacp = %(gpon_lacp)s,
-    neighbot_hostname = %(neighbot_hostname)s,
-    neighbor_intf = %(neighbor_intf)s,
-    neighbor_lacp = %(neighbor_lacp)s,
-    bw = %(bw)s,
-    sfp = %(sfp)s,
-    vlan_sip = %(vlan_sip)s,
-    vlan_internet = %(vlan_internet)s,
-    keterangan = %(keterangan)s,
-    otn_cross_metro = %(otn_cross_metro)s
-WHERE sto = %(sto)s AND gpon_hostname = %(gpon_hostname)s
-"""
-
-def upsert_data(table_name: str, row: dict):
-    conn = pymysql.connect(**db_config)
-    with conn:
+def clear_table(table):
+    with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(UPDATE_SQL.format(table=table_name), row)
-            if cur.rowcount == 0:
-                cur.execute(INSERT_SQL.format(table=table_name), row)
+            cur.execute(f"DELETE FROM `{table}`")
         conn.commit()
 
-# Step 1
-async def start_inputmetro(update: Update, context: CallbackContext) -> int:
-    keyboard = [[InlineKeyboardButton(opt, callback_data=f"select_witel|{opt}")] for opt in WITEL_OPTIONS]
-    await update.message.reply_text(
-        "📂 Pilih WITEL untuk input data Metro:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return ASK_WITEL
+def insert_mysql(table, data):
+    cols = ", ".join([f"`{col}`" for col in COLUMNS])
+    placeholders = ", ".join(["%s"] * len(COLUMNS))
 
-# Step 2
-async def handle_witel_selection(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    await query.answer()
-    _, witel = query.data.split("|", 1)
-    context.user_data["witel"] = witel
-    sto_list = STO_OPTIONS.get(witel.upper(), [])
-    keyboard = [[InlineKeyboardButton(sto, callback_data=f"select_sto|{sto}")] for sto in sto_list]
-    await query.edit_message_text(
-        f"🏢 WITEL *{witel.upper()}* dipilih. Pilih STO:",
+    sql = f"""
+        INSERT INTO `{table}` ({cols})
+        VALUES ({placeholders})
+    """
+    values = tuple(data.get(col, None) for col in COLUMNS)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, values)
+        conn.commit()
+
+# Start /inputmetro
+async def start_inputmetro(update: Update, context: CallbackContext) -> int:
+    keyboard = [[InlineKeyboardButton(w, callback_data=f"witel|{w}")] for w in WITEL_OPTIONS]
+    await update.message.reply_text(
+        "📡 Silakan pilih *WITEL* untuk input data Metro:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
-    return ASK_STO
+    return ASK_WITEL
 
-# Step 3
-async def handle_sto_selection(update: Update, context: CallbackContext) -> int:
+# Setelah pilih WITEL
+async def handle_witel(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
-    _, sto = query.data.split("|", 1)
-    context.user_data["sto"] = sto
-    substo_list = SUBSTO_OPTIONS.get(sto.upper())
-    if substo_list:
-        keyboard = [[InlineKeyboardButton(s, callback_data=f"select_substo|{s}")] for s in substo_list]
-        await query.edit_message_text(
-            f"🏢 STO *{sto.upper()}* dipilih.\nPilih Sub-STO:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-        return ASK_SUBSTO
+    witel = query.data.split("|")[1]
+    context.user_data["witel"] = witel.upper()
+
     await query.edit_message_text(
-        f"📥 *STO:* {sto}\nSilakan kirim file Excel (.xlsx/.xls):",
+        f"📁 WITEL *{witel}* dipilih.\n\nSilakan upload file Excel (.xlsx) sesuai format berikut.\n\n📎 File contoh akan dikirim sebentar lagi...",
         parse_mode="Markdown"
     )
+
+    contoh_path = "E:/Telkom/Telkom_Activity.bot/Uplink GPON-Metro Malang (rev).xlsx"
+    if os.path.exists(contoh_path):
+        with open(contoh_path, "rb") as f:
+            await context.bot.send_document(chat_id=query.message.chat_id, document=InputFile(f), filename=os.path.basename(contoh_path))
+    else:
+        await context.bot.send_message(chat_id=query.message.chat_id, text="⚠️ Contoh file tidak ditemukan di server.")
+
     return ASK_FILE
 
-# Step 4
-async def handle_substo_selection(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    await query.answer()
-    _, substo = query.data.split("|", 1)
-    context.user_data["substo"] = substo
-    await query.edit_message_text(
-        f"📥 *Sub-STO:* {substo}\nSilakan kirim file Excel (.xlsx/.xls):",
-        parse_mode="Markdown"
-    )
-    return ASK_FILE
+# Bersihkan sel
+def clean(val):
+    return None if pd.isna(val) else str(val).strip()
 
-# String sanitizer
-def clean_str(val, max_len):
-    if val is None or pd.isna(val):
-        return None
-    s = str(val).strip()
-    s = re.sub(r"[^\x20-\x7E]", "", s)
-    return s[:max_len] or None
-
-# Final Step
-async def handle_file_input(update: Update, context: CallbackContext) -> int:
+# Handle upload file
+async def handle_file(update: Update, context: CallbackContext) -> int:
     doc = update.message.document
-    if doc.mime_type not in (
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "application/vnd.ms-excel"
-    ):
-        await update.message.reply_text("❌ Harap kirim file .xlsx/.xls.")
+    if not doc.file_name.endswith(".xlsx"):
+        await update.message.reply_text("❌ File harus berformat .xlsx")
         return ConversationHandler.END
 
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        path = tmp.name
-    file_obj = await doc.get_file()
-    await file_obj.download_to_drive(path)
-    await update.message.reply_text("📥 File diterima, memproses...")
+    await update.message.reply_text("📤 File diterima. Sedang diproses...")
 
+    file = await doc.get_file()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        path = tmp.name
+        await file.download_to_drive(path)
+
+    failed_rows = []
     try:
         df = pd.read_excel(path)
-        df.columns = df.columns.str.lower().str.strip().str.replace(" ", "_", regex=False)
-        df = df.replace({pd.NA: None, "nan": None, "NaN": None, "": None})
+        df.columns = [c.strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns]
+        df = df.rename(columns={"otn_cross_metro": "OTN-CROSS METRO", "keterangan": "Keterangan"})
 
-        df["bw"] = df.get("bw").apply(lambda v: clean_str(v, 10))
-        df["sfp"] = df.get("sfp").apply(lambda v: clean_str(v, 20))
-        df["gpon_ip"] = df.get("gpon_ip").apply(lambda v: clean_str(v, 20))
+        witel = context.user_data.get("witel", "").strip().lower()
+        df["witel"] = witel
+        table = f"data_uplink_{witel}"
 
-        records = df.to_dict(orient="records")
-        witel = context.user_data.get("witel")
-        sto = context.user_data.get("substo") or context.user_data.get("sto")
-        table_name = f"data_uplink_{sto.lower()}"
+        clear_table(table)
 
-        total, success, failed = len(records), 0, []
-        loop = asyncio.get_running_loop()
-
-        for idx, row in enumerate(records, start=1):
-            row["witel"] = witel
-            row["sto"] = row.get("sto") or sto
-            safe_row = {k: (str(v).strip() if v is not None else None) for k, v in row.items()}
-
+        count, failed = 0, 0
+        for i, row in df.iterrows():
+            data = {col: clean(row.get(col.replace(" ", "_").replace("-", "_").lower())) for col in COLUMNS}
             try:
-                await loop.run_in_executor(None, upsert_data, table_name, safe_row)
-                success += 1
+                insert_mysql(table, data)
+                count += 1
             except Exception as e:
-                logger.error("Baris %d gagal: %s | payload=%r", idx, e, safe_row)
-                failed.append(f"[{idx}] {safe_row.get('gpon_hostname')} | {e}")
-
-            if idx % 500 == 0 or idx == total:
-                await update.message.reply_text(f"📦 Progress: {idx}/{total}")
-                await asyncio.sleep(1)
+                failed += 1
+                failed_rows.append(f"Baris {i+2}: {e}")
+                logger.warning(f"Gagal insert baris {i+2}: {e}")
 
         await update.message.reply_text(
-            f"📊 *Ringkasan Input Data Metro:*\n- Total Baris: {total}\n- Berhasil: {success}\n- Gagal: {len(failed)}",
+            f"📊 Ringkasan Input Data Metro:\n- Total Baris: {len(df)}\n- Berhasil: {count}\n- Gagal: {failed}",
             parse_mode="Markdown"
         )
 
-        if failed:
-            content = "\n".join(failed)
-            with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tf:
-                tf.write(content.encode("utf-8"))
-                fail_path = tf.name
-            with open(fail_path, "rb") as fp:
-                await update.message.reply_document(fp, filename="failed_metro.txt")
-            os.remove(fail_path)
+        if failed_rows:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8") as f:
+                for line in failed_rows:
+                    f.write(line + "\n")
+                failed_path = f.name
+
+            await update.message.reply_document(
+                document=open(failed_path, "rb"),
+                filename="data_gagal_input.txt",
+                caption="📎 Berikut ini daftar baris yang gagal diinput:"
+            )
+            os.remove(failed_path)
 
     except Exception as e:
-        logger.error("Error proses file metro: %s", e)
-        await update.message.reply_text(f"❌ Gagal memproses file: `{e}`", parse_mode="Markdown")
+        logger.exception("Gagal memproses file:")
+        await update.message.reply_text(f"❌ Gagal memproses file:\n{e}")
     finally:
         os.remove(path)
 
     return ConversationHandler.END
 
-# Register handler
-def register_handler(app: Application) -> None:
-    conv = ConversationHandler(
-        entry_points=[CommandHandler(["inputmetro", "inputuplink"], start_inputmetro)],
+# Registrasi handler
+def register_handler(application: Application):
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("inputmetro", start_inputmetro)],
         states={
-            ASK_WITEL: [CallbackQueryHandler(handle_witel_selection, pattern=r"^select_witel\|")],
-            ASK_STO: [CallbackQueryHandler(handle_sto_selection, pattern=r"^select_sto\|")],
-            ASK_SUBSTO: [CallbackQueryHandler(handle_substo_selection, pattern=r"^select_substo\|")],
-            ASK_FILE: [MessageHandler(filters.Document.ALL, handle_file_input)]
+            ASK_WITEL: [CallbackQueryHandler(handle_witel, pattern="^witel\\|")],
+            ASK_FILE: [MessageHandler(filters.Document.ALL, handle_file)],
         },
         fallbacks=[],
-        allow_reentry=True
     )
-    app.add_handler(conv)
+    application.add_handler(conv_handler)

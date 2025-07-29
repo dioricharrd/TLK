@@ -1,26 +1,34 @@
 # bot.py
 
 import os
+import logging
 from dotenv import load_dotenv
 from telegram.ext import Application
 
-# Hanya satu import: fungsi yang mendaftarkan semua handler
+# Import fungsi register handler dari base_command
 from handler.base_command import register_handler
 
 def main():
-    # Muat environment variables dari .env
+    # Load environment variables
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
+    
     if not token:
-        raise RuntimeError("BOT_TOKEN environment variable is not set")
+        raise RuntimeError("BOT_TOKEN environment variable is not set in .env")
 
-    # Bangun Telegram Application
+    # Optional: Logging ke console
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO
+    )
+
+    # Bangun aplikasi bot Telegram
     app = Application.builder().token(token).build()
 
-    # Daftarkan seluruh command & conversation handler
+    # Daftarkan semua command dan conversation handler
     register_handler(app)
 
-    print("Bot running…")
+    print("🤖 Bot is running... Tekan Ctrl+C untuk berhenti.")
     app.run_polling()
 
 if __name__ == "__main__":

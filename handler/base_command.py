@@ -4,7 +4,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackContext, CommandHandler, CallbackQueryHandler
 
 # Import register_handler dari tiap modul perintah
-from handler.cekgpon_command    import register_handler as register_cekgpon
+from handler.cekftm_command    import register_handler as register_cekgpon
 from handler.cekmetro_command   import register_handler as register_cekmetro
 from handler.inputftm_command   import register_handler as register_inputftm
 from handler.inputmetro_command import register_handler as register_inputmetro

@@ -1,271 +1,186 @@
 import os
-import asyncio
-import tempfile
 import logging
+import tempfile
 import pandas as pd
-from database.db import get_connection_database
+import pymysql
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
-    CallbackContext,
-    CommandHandler,
-    ConversationHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
+    Application, CommandHandler, CallbackContext, ConversationHandler,
+    CallbackQueryHandler, MessageHandler, filters
 )
 
-# Load environment
+# Load ENV dan logging
 load_dotenv()
-
-# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# States
-ASK_WITEL, ASK_STO, ASK_SUBSTO, ASK_FILE = range(4)
-
-# WITEL and STO options
+# State mesin
+ASK_WITEL, ASK_FILE = range(2)
 WITEL_OPTIONS = ["MLG", "MNZ", "KDR"]
-STO_OPTIONS = {
-    "MLG": ["BTU","KEP",  "MLG"],
-    "MNZ": ["BJN", "MNZ", "NWI", "PON", "TNZ"],
-    "KDR": ["BLR", "PAE", "KDI", "NJK", "TRE", "TUL"]
+
+# Kolom target sesuai tabel SQL
+COLUMNS = [
+    "witel", "sto", "nama_gpon", "ip", "card", "port",
+    "nama_lemari_ftm_eakses", "no_panel_eakses", "no_port_panel",
+    "nama_lemari_ftm_oakses", "no_panel_oakses", 
+    "no_core_feeder", "nama_segmen_feeder_utama", "status_feeder",
+    "kapasitas_kabel_feeder_utama", "nama_odc"
+]
+
+# DB config
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "user": os.getenv("DB_USER", "root"),
+    "password": os.getenv("DB_PASS", ""),
+    "db": os.getenv("DB_NAME", "tlkm"),
+    "cursorclass": pymysql.cursors.DictCursor,
+    "charset": "utf8mb4"
 }
 
-# Sub-STO options for specific STOs
-SUBSTO_OPTIONS = {
-    "BTU": ["BTU", "KPO", "NTG"],
-    "KEP": ["GKW", "KEP", "PGK", "SBP", "DPT", "SBM", "TUR", "BNR", "GDI", "APG", "DNO"],
-    "MLG": ["BLB", "GDG", "KLJ", "MLG", "PKS", "TMP", "BRG", "SWJ", "LWG", "SGS"],
-    "BJN": ["BJN", "KDU", "PAD", "SMJ"],
-    "MNZ": ["MNZ", "UTR", "MSP", "CRB"],
-    "NWI": ["MGT", "NWI", "GGR", "SAR", "WKU", "JGO", "KRJ"],
-    "PON": ["PON", "PNZ", "SMO", "PNG", "PLG", "SAT", "JEN", "SLH", "LOG"],
-    "TNZ": ["BCR", "JTR", "KRK", "MRR", "RGL", "TNZ", "TAW"],
-    "BLR": ["BLR", "SNT", "PAN", "BNU", "KBN", "LDY", "WGI"],
-    "PAE": ["GUR", "WAT", "KAA", "PAE", "PPR"],
-    "KDI": ["KDI", "MJT", "NDL", "SBI"],
-    "NJK": ["GON", "NJK", "KTS", "PRB", "WRJ"],
-    "TRE": ["DRN", "PRI", "TRE"],
-    "TUL": ["CAT", "KWR", "NGU", "TUL"]
-}
+def get_connection():
+    return pymysql.connect(**DB_CONFIG)
 
-async def cancel_handler(update: Update, context: CallbackContext) -> int:
-    await update.message.reply_text("❌ Operasi dibatalkan.")
-    return ConversationHandler.END
+def clear_table(table):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"DELETE FROM `{table}`")
+        conn.commit()
 
+def insert_mysql(table, data):
+    cols = ", ".join([f"`{col}`" for col in COLUMNS])
+    placeholders = ", ".join(["%s"] * len(COLUMNS))
+    sql = f"INSERT INTO `{table}` ({cols}) VALUES ({placeholders})"
+    values = tuple(data.get(col, None) for col in COLUMNS)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, values)
+        conn.commit()
+
+def clean(val):
+    return None if pd.isna(val) else str(val).strip()
+
+# Command /inputftm
 async def start_inputftm(update: Update, context: CallbackContext) -> int:
-    keyboard = [[InlineKeyboardButton(opt, callback_data=f"select_witel|{opt}")] for opt in WITEL_OPTIONS]
+    keyboard = [[InlineKeyboardButton(w, callback_data=f"witel|{w}")] for w in WITEL_OPTIONS]
     await update.message.reply_text(
-        "📂 Silakan pilih WITEL untuk input data FTM:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "📡 Silakan pilih *WITEL* untuk input data FTM:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
     )
     return ASK_WITEL
 
-async def handle_witel_selection(update: Update, context: CallbackContext) -> int:
+async def handle_witel(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
-    _, witel = query.data.split("|", 1)
-    context.user_data["witel"] = witel
+    witel = query.data.split("|")[1]
+    context.user_data["witel"] = witel.lower()
 
-    sto_list = STO_OPTIONS.get(witel.upper(), [])
-    if sto_list:
-        keyboard = [[InlineKeyboardButton(sto, callback_data=f"select_sto|{sto}")] for sto in sto_list]
-        await query.edit_message_text(
-            f"🏢 WITEL *{witel.upper()}* dipilih. Pilih STO:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-        return ASK_STO
+    await query.edit_message_text(
+        f"📁 WITEL *{witel}* dipilih.\n\nSilakan upload file Excel (.xlsx) sesuai format berikut.",
+        parse_mode="Markdown"
+    )
+
+    contoh_path = "E:/Telkom/Telkom_Activity.bot/Input FTM.xlsx"
+    if os.path.exists(contoh_path):
+        with open(contoh_path, "rb") as f:
+            await context.bot.send_document(chat_id=query.message.chat_id, document=InputFile(f), filename=os.path.basename(contoh_path))
     else:
-        await query.edit_message_text(
-            f"📥 *WITEL:* {witel}\nSilakan kirim file Excel (.xlsx/.xls):",
-            parse_mode="Markdown"
-        )
-        return ASK_FILE
+        await context.bot.send_message(chat_id=query.message.chat_id, text="⚠️ Contoh file tidak ditemukan di server.")
 
-async def handle_sto_selection(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    await query.answer()
-    _, sto = query.data.split("|", 1)
-    context.user_data["sto"] = sto
-
-    if sto in SUBSTO_OPTIONS:
-        keyboard = [
-            [InlineKeyboardButton(sub, callback_data=f"select_substo|{sub}")]
-            for sub in SUBSTO_OPTIONS[sto]
-        ]
-        await query.edit_message_text(
-            f"📍 Sub-STO untuk {sto}, silakan pilih:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return ASK_SUBSTO
-
-    await query.edit_message_text(
-        f"📥 *STO:* {sto}\nSilakan kirim file Excel (.xlsx/.xls):",
-        parse_mode="Markdown"
-    )
     return ASK_FILE
 
-async def handle_substo_selection(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    await query.answer()
-    _, substo = query.data.split("|", 1)
-    context.user_data["sto"] = substo
-
-    await query.edit_message_text(
-        f"📥 *Sub-STO:* {substo}\nSilakan kirim file Excel (.xlsx/.xls):",
-        parse_mode="Markdown"
-    )
-    return ASK_FILE
-
-async def handle_file_input_ftm(update: Update, context: CallbackContext) -> int:
+async def handle_file(update: Update, context: CallbackContext) -> int:
     doc = update.message.document
-    if doc.mime_type not in (
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "application/vnd.ms-excel"
-    ):
-        await update.message.reply_text("❌ Harap kirim file .xlsx/.xls.")
+    if not doc.file_name.endswith(".xlsx"):
+        await update.message.reply_text("❌ File harus berformat .xlsx")
         return ConversationHandler.END
 
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+    await update.message.reply_text("📤 File diterima. Sedang diproses...")
+
+    file = await doc.get_file()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         path = tmp.name
-    file_obj = await doc.get_file()
-    await file_obj.download_to_drive(path)
-    await update.message.reply_text("📥 File diterima, memproses...")
+        await file.download_to_drive(path)
 
+    failed_rows = []
     try:
-        df = pd.read_excel(path)
-        df.columns = df.columns.str.lower().str.strip().str.replace(" ", "_", regex=False)
-        df = df.where(pd.notna(df), None)
-        records = df.to_dict(orient="records")
+        df_raw = pd.read_excel(path, header=0)
+        df_raw.columns = [col.strip().lower().replace(" ", "_").replace("-", "_") for col in df_raw.columns]
 
-        witel = context.user_data.get("witel")
-        sto = context.user_data.get("sto")
-        table_name = f"data_{sto.lower()}"
+        # Atasi duplikat kolom no_port_panel
+        if df_raw.columns.tolist().count("no_port_panel") == 2:
+            cols = []
+            counter = 0
+            for col in df_raw.columns:
+                if col == "no_port_panel":
+                    if counter == 0:
+                        cols.append("no_port_panel_eakses")
+                    else:
+                        cols.append("no_port_panel_oakses")
+                    counter += 1
+                else:
+                    cols.append(col)
+            df_raw.columns = cols
 
-        total, success, failed = len(records), 0, []
-        loop = asyncio.get_running_loop()
+        df = df_raw.copy()
 
-        for idx, row in enumerate(records, start=1):
-            raw_sto = row.get("sto")
-            sto_payload = raw_sto or sto
-            if not sto_payload:
-                failed.append(f"[Baris {idx}] STO kosong")
-                continue
+        witel = context.user_data.get("witel", "").strip().lower()
+        df["witel"] = witel
+        table = f"data_ftm_{witel}"
 
-            payload = {
-                "witel": witel,
-                "sto": sto_payload,
-                "nama_gpon": row.get("nama_gpon"),
-                "ip": row.get("ip"),
-                "card": row.get("card"),
-                "port": row.get("port"),
-                "category": witel,
-                "nama_lemari_ftm_eakses": row.get("nama_lemari_ftm_eakses"),
-                "no_panel_eakses": row.get("no_panel_eakses"),
-                "no_port_panel": row.get("no_port_panel"),
-                "nama_lemari_ftm_oakses": row.get("nama_lemari_ftm_oakses"),
-                "no_panel_oakses": row.get("no_panel_oakses"),
-                "no_port_panel_1": row.get("no_port_panel_1"),
-                "no_core_feeder": row.get("no_core_feeder"),
-                "nama_segmen_feeder_utama": row.get("nama_segmen_feeder_utama"),
-                "status_feeder": row.get("status_feeder"),
-                "kapasitas_kabel_feeder_utama": row.get("kapasitas_kabel_feeder_utama"),
-                "nama_odc": row.get("nama_odc")
-            }
+        # Validasi kolom
+        missing = [col for col in COLUMNS if col not in df.columns]
+        if missing:
+            await update.message.reply_text(f"❌ Kolom berikut tidak ditemukan di file:\n{', '.join(missing)}")
+            return ConversationHandler.END
 
+        clear_table(table)
+
+        count, failed = 0, 0
+        for i, row in df.iterrows():
+            data = {col: clean(row.get(col)) for col in COLUMNS}
             try:
-                await loop.run_in_executor(None, upsert_data, table_name, payload)
-                success += 1
+                insert_mysql(table, data)
+                count += 1
             except Exception as e:
-                logger.error("Baris %d gagal: %s | payload=%r", idx, e, payload)
-                failed.append(f"{sto_payload}|{row.get('nama_gpon')}|{e}")
+                failed += 1
+                failed_rows.append(f"Baris {i+2}: {e}")
+                logger.warning(f"Gagal insert baris {i+2}: {e}")
 
-            if idx % 500 == 0 or idx == total:
-                await update.message.reply_text(f"📦 Progress: {idx}/{total}")
-                await asyncio.sleep(1)
-
-        summary = (
-            f"📊 *Ringkasan Input Data FTM:*\n"
-            f"- Total Baris: {total}\n"
-            f"- Berhasil: {success}\n"
-            f"- Gagal: {len(failed)}"
+        await update.message.reply_text(
+            f"📊 Ringkasan Input Data FTM:\n- Total Baris: {len(df)}\n- Berhasil: {count}\n- Gagal: {failed}",
+            parse_mode="Markdown"
         )
-        await update.message.reply_text(summary, parse_mode="Markdown")
 
-        if failed:
-            content = "\n".join(failed)
-            with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tf:
-                tf.write(content.encode('utf-8'))
-                fail_path = tf.name
-            with open(fail_path, 'rb') as fp:
-                await update.message.reply_document(fp, filename="failed_ftm.txt")
-            os.remove(fail_path)
+        if failed_rows:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8") as f:
+                for line in failed_rows:
+                    f.write(line + "\n")
+                failed_path = f.name
+
+            await update.message.reply_document(
+                document=open(failed_path, "rb"),
+                filename="data_gagal_input.txt",
+                caption="📎 Berikut ini daftar baris yang gagal diinput:"
+            )
+            os.remove(failed_path)
 
     except Exception as e:
-        logger.exception("Error proses file FTM: %s", e)
-        await update.message.reply_text(f"❌ Gagal memproses file: `{e}`", parse_mode="Markdown")
+        logger.exception("Gagal memproses file:")
+        await update.message.reply_text(f"❌ Gagal memproses file:\n{e}")
     finally:
         os.remove(path)
 
     return ConversationHandler.END
 
-# SQL templates
-INSERT_SQL_TEMPLATE = """
-INSERT INTO `{table}` (witel, sto, nama_gpon, ip, card, port, category, nama_lemari_ftm_eakses, no_panel_eakses, no_port_panel, nama_lemari_ftm_oakses, no_panel_oakses, no_port_panel_1, no_core_feeder, nama_segmen_feeder_utama, status_feeder, kapasitas_kabel_feeder_utama, nama_odc)
-VALUES (%(witel)s, %(sto)s, %(nama_gpon)s, %(ip)s, %(card)s, %(port)s, %(category)s, %(nama_lemari_ftm_eakses)s, %(no_panel_eakses)s, %(no_port_panel)s, %(nama_lemari_ftm_oakses)s, %(no_panel_oakses)s, %(no_port_panel_1)s, %(no_core_feeder)s, %(nama_segmen_feeder_utama)s, %(status_feeder)s, %(kapasitas_kabel_feeder_utama)s, %(nama_odc)s)
-"""
-
-UPDATE_SQL_TEMPLATE = """
-UPDATE `{table}` SET
-    ip = %(ip)s,
-    card = %(card)s,
-    port = %(port)s,
-    category = %(category)s,
-    nama_lemari_ftm_eakses = %(nama_lemari_ftm_eakses)s,
-    no_panel_eakses = %(no_panel_eakses)s,
-    no_port_panel = %(no_port_panel)s,
-    nama_lemari_ftm_oakses = %(nama_lemari_ftm_oakses)s,
-    no_panel_oakses = %(no_panel_oakses)s,
-    no_port_panel_1 = %(no_port_panel_1)s,
-    no_core_feeder = %(no_core_feeder)s,
-    nama_segmen_feeder_utama = %(nama_segmen_feeder_utama)s,
-    status_feeder = %(status_feeder)s,
-    kapasitas_kabel_feeder_utama = %(kapasitas_kabel_feeder_utama)s,
-    nama_odc = %(nama_odc)s
-WHERE sto = %(sto)s AND nama_gpon = %(nama_gpon)s
-"""
-
-def upsert_data(table_name: str, row: dict):
-    try:
-        conn = get_connection_database()
-        insert_sql = INSERT_SQL_TEMPLATE.format(table=table_name)
-
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(insert_sql, row)  # Hanya lakukan insert
-            conn.commit()
-
-    except Exception as e:
-        raise Exception(f"[DB ERROR] {e}")
-
-
-def register_handler(app) -> None:
-    conv = ConversationHandler(
+def register_handler(application: Application):
+    conv_handler = ConversationHandler(
         entry_points=[CommandHandler("inputftm", start_inputftm)],
         states={
-            ASK_WITEL: [CallbackQueryHandler(handle_witel_selection, pattern=r"^select_witel\|")],
-            ASK_STO: [CallbackQueryHandler(handle_sto_selection, pattern=r"^select_sto\|")],
-            ASK_SUBSTO: [CallbackQueryHandler(handle_substo_selection, pattern=r"^select_substo\|")],
-            ASK_FILE: [MessageHandler(
-                filters.Document.MimeType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") |
-                filters.Document.MimeType("application/vnd.ms-excel"),
-                handle_file_input_ftm
-            )],
+            ASK_WITEL: [CallbackQueryHandler(handle_witel, pattern="^witel\\|")],
+            ASK_FILE: [MessageHandler(filters.Document.ALL, handle_file)],
         },
-        fallbacks=[CommandHandler("cancel", cancel_handler)],
-        allow_reentry=True,
+        fallbacks=[],
     )
-    app.add_handler(conv)
+    application.add_handler(conv_handler)
